@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "J28YI1ELZgIVuyKDjgLgx"
+uri = "file://assets/casino_ui/rollers_menu_banner.gif"
+type = "image"
+title = "Rollers Casino welcome banner GIF"
+description = "Looping 900×590 menu banner, about 2.9 seconds long, made from the clean logo segment of your screen recording with ‘Welcome to Rollers Casino’ text."
+logical_id = "470977f4-2769-4c46-acca-b9d8a7450891"
+content_hash = "sha256:083ccf93e5c3ffb0a81a5e5ff002af26cd47febb16b6cebc6ed7f399db14b0ac"
+size = 1608841
+mtime_ms = 1791532365028
+storage_uri = "gcs://replit-rams-assets-sisko/rams/assets/repl:dcffd766-d9db-4071-a67f-d0e5332c4443/470977f4-2769-4c46-acca-b9d8a7450891/401724f3-2c7d-400c-b271-d6148d28bdaf"
+storage_version_token = "1791532460991071"
+content_type = "image/gif"

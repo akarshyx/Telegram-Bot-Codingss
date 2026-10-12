@@ -1,0 +1,1 @@
+- [Rollers withdrawal policy](rollers-withdrawal-policy.md) — a recent crypto deposit or approved `/botdepo` qualifies all balance types; withdrawal links use @rollersgamesbot.
