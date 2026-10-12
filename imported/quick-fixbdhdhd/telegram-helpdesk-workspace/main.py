@@ -9536,10 +9536,17 @@ async def handle_games_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await show_games_category_selection(query, context)
 
 
-# ── Premium animated custom-emoji packs (first match wins per unicode emoji) ──
+# ── Premium custom-emoji packs ─────────────────────────────────────────────
+RAIKA_RANK_PACK_NAME = "RaikaRanks"
+RANK_EMOJI_PACK_TITLE = "Rollers Rank Emoji"
+DIAMOND_GAME_EMOJI_PACK_NAME = (
+    "ST_5PUsQEHbxN5l8Vy2fX6sGtMS_QszrcOUd9xfUjno_by_StickersPackRobot"
+)
+
 CUSTOM_EMOJI_PACKS = [
     "rollerscasino_by_rollersgamebot",  # public Roller’s Casino game emoji pack
-    "raikarank",                    # rank/reward emoji reference pack
+    RAIKA_RANK_PACK_NAME,           # rank/reward emojis; applied only to rank labels
+    DIAMOND_GAME_EMOJI_PACK_NAME,   # Diamonds game emojis; applied only in that game
     "RollersProgressBar_by_CheakLeaksBot",  # connected progress-bar segments
     "FinanceEmoji",
     "NewsEmoji",
@@ -9585,6 +9592,79 @@ _DC_EMOJI_CHAR_MAP: dict = {
 }
 # Maps unicode emoji → custom_emoji_id (populated at startup by _load_custom_emoji_pack)
 CUSTOM_EMOJI_MAP: dict = {}
+
+
+def _apply_rank_custom_emoji_stickers(stickers: list) -> int:
+    """Use the rank pack's ordered custom emoji IDs, retaining Unicode fallbacks."""
+    global RANK_TIER_CUSTOM_EMOJI
+    current = list(RANK_TIER_CUSTOM_EMOJI)
+    rank_stickers = [
+        sticker.get("custom_emoji_id")
+        for sticker in stickers
+        if sticker.get("custom_emoji_id")
+    ]
+    applied = min(len(current), len(rank_stickers))
+    for index in range(applied):
+        plain_fallback, _old_id = current[index]
+        current[index] = (plain_fallback, rank_stickers[index])
+    RANK_TIER_CUSTOM_EMOJI = current
+    return applied
+
+
+def _apply_diamond_game_custom_emoji_stickers(stickers: list) -> bool:
+    """Use the supplied Diamonds pack only when its role mapping is unambiguous."""
+    global DIAMOND_EMOJI_IDS
+    usable = [
+        sticker for sticker in stickers
+        if sticker.get("custom_emoji_id")
+    ]
+    if not usable:
+        return False
+
+    current_ids = set(DIAMOND_EMOJI_IDS.values())
+    pack_ids = {sticker["custom_emoji_id"] for sticker in usable}
+    if current_ids and current_ids.issubset(pack_ids):
+        logger.info("[Diamonds pack] Existing game emoji IDs verified in the supplied pack")
+        return True
+
+    keys = tuple(DIAMOND_EMOJI_IDS)
+    by_alt = {
+        "🔴": "red", "❤️": "red", "❤": "red", "🟥": "red", "💔": "red",
+        "🔵": "blue", "💙": "blue", "🟦": "blue",
+        "🟣": "purple", "💜": "purple", "🟪": "purple",
+        "🟢": "green", "💚": "green", "🟩": "green",
+        "🟡": "yellow", "💛": "yellow", "🟨": "yellow",
+        "⬛": "off", "◼️": "off", "◾": "off", "⚫": "off",
+        "💎": "lit", "💠": "lit", "🔹": "lit",
+    }
+    mapped = {}
+    for sticker in usable:
+        role = by_alt.get(sticker.get("emoji", ""))
+        if role:
+            mapped.setdefault(role, sticker["custom_emoji_id"])
+
+    if set(keys).issubset(mapped):
+        DIAMOND_EMOJI_IDS = {
+            key: mapped[key] for key in keys
+        }
+        logger.info("[Diamonds pack] Applied all seven game emoji roles by sticker alt")
+        return True
+
+    # The dedicated Diamonds pack is sometimes an ordered seven-sticker set with
+    # repeated 💎 fallbacks. In that case its sticker order matches the game map.
+    if len(usable) == len(keys):
+        DIAMOND_EMOJI_IDS = {
+            key: sticker["custom_emoji_id"]
+            for key, sticker in zip(keys, usable)
+        }
+        logger.info("[Diamonds pack] Applied seven game emoji roles in pack order")
+        return True
+
+    logger.warning(
+        f"[Diamonds pack] Found {len(usable)} stickers but could not safely map "
+        "them to off/lit/red/blue/purple/green/yellow; existing game mapping retained"
+    )
+    return False
 
 # Cryptocoins_kotletovv pack — per-sticker access (the pack has many stickers all
 # tagged with 🤑/🪙, so we keep the full ordered list and resolve a sticker per coin).
@@ -9638,13 +9718,16 @@ NETWORK_DISPLAY = {
 
 
 async def _load_custom_emoji_pack(bot) -> None:
-    """Fetch every premium custom-emoji pack once at startup and merge them.
+    """Fetch each configured custom-emoji pack once at startup.
     Uses raw httpx to bypass PTB StickerSet de-serialisation issues
     (some Bot API fields changed in newer versions, breaking the PTB parser)."""
     global CUSTOM_EMOJI_MAP, CRYPTOCOINS_STICKERS, CRYPTOCOINS_DEFAULT_ID, _DC_MOJI_STICKERS, _DC_MOJI_BY_CODE, _PROGRESS_BAR_STICKERS, _ROLLERS_CASINO_EMOJI_MAP
     global _BJ_HIDDEN_EMOJI_ID, _BJ_HEADER_EMOJI_ID
+    global RANK_TIER_CUSTOM_EMOJI, DIAMOND_EMOJI_IDS
     merged: dict = {}
     rollers_casino_map: dict = {}
+    rank_pack_stickers: list = []
+    diamond_game_pack_stickers: list = []
     import httpx as _hx
     for pack in CUSTOM_EMOJI_PACKS:
         try:
@@ -9657,6 +9740,10 @@ async def _load_custom_emoji_pack(bot) -> None:
             if not _data.get("ok"):
                 raise RuntimeError(_data.get("description", "API error"))
             stickers_raw = _data["result"].get("stickers", [])
+            if pack == RAIKA_RANK_PACK_NAME:
+                rank_pack_stickers = stickers_raw
+            elif pack == DIAMOND_GAME_EMOJI_PACK_NAME:
+                diamond_game_pack_stickers = stickers_raw
             added = 0
             for st in stickers_raw:
                 ce_id = st.get("custom_emoji_id")
@@ -9724,9 +9811,50 @@ async def _load_custom_emoji_pack(bot) -> None:
                 if "card_back" in _BJ_BUTTON_EMOJI_IDS:
                     _BJ_HIDDEN_EMOJI_ID = _BJ_BUTTON_EMOJI_IDS["card_back"]
                     _BJ_HEADER_EMOJI_ID = _BJ_BUTTON_EMOJI_IDS["card_back"]
-            logger.info(f"✅ Loaded {added} animated emoji from {pack}")
+            logger.info(f"✅ Loaded {added} custom emoji from {pack}")
         except Exception as e:
-            logger.warning(f"[premium-emoji] Could not load pack {pack}: {e}")
+            # Never include request exception strings here: httpx errors may
+            # echo the Bot API URL, which contains the token.
+            logger.warning(
+                f"[premium-emoji] Could not load pack {pack}: "
+                f"{type(e).__name__}"
+            )
+    if rank_pack_stickers:
+        _applied_rank_count = _apply_rank_custom_emoji_stickers(rank_pack_stickers)
+        logger.info(
+            f"[rank emojis] Applied {_applied_rank_count} IDs from "
+            f"{RAIKA_RANK_PACK_NAME}; unfilled ranks use Unicode fallbacks"
+        )
+        # Prefer the owner's copy after it has been created, so rank displays
+        # continue using the new pack after a bot restart.
+        try:
+            _bot_info = await bot.get_me()
+            if _bot_info.username:
+                _rank_copy_name = (
+                    f"rollers_rank_emoji_by_{_bot_info.username}".lower()
+                )
+                async with _hx.AsyncClient(timeout=15) as _rank_client:
+                    _rank_response = await _rank_client.get(
+                        f"https://api.telegram.org/bot{bot.token}/getStickerSet",
+                        params={"name": _rank_copy_name},
+                    )
+                _rank_data = _rank_response.json()
+                if _rank_data.get("ok"):
+                    _rank_copy_stickers = _rank_data["result"].get("stickers", [])
+                    _copy_count = _apply_rank_custom_emoji_stickers(
+                        _rank_copy_stickers
+                    )
+                    logger.info(
+                        f"[rank emojis] Preferred owner copy {_rank_copy_name}; "
+                        f"loaded {_copy_count} tier emojis"
+                    )
+        except Exception as _rank_copy_error:
+            logger.debug(
+                f"[rank emojis] Owner copy not available; keeping "
+                f"{RAIKA_RANK_PACK_NAME} ({type(_rank_copy_error).__name__})"
+            )
+    if diamond_game_pack_stickers:
+        _apply_diamond_game_custom_emoji_stickers(diamond_game_pack_stickers)
     # Only the public Rollers Casino pack is allowed to drive user-facing
     # emoji.  The previous merge let unrelated packs override the same
     # Unicode character with animated artwork.
@@ -17105,23 +17233,24 @@ def get_rank_info(rank_idx):
     tier, sub, threshold, bonus, emoji = CASINO_RANKS[idx]
     return f"{tier} {_CR_SUB[sub-1]}", emoji
 
-# ── Rank custom animated emoji pack (ranksby_arshxy_by_fStikBot) ─────────────
-# 14 entries — one per tier, indexed by (rank_idx // 5)
+# ── Rank custom emoji pack (RaikaRanks) ─────────────────────────────────────
+# 14 entries — one per tier, indexed by (rank_idx // 5). IDs are loaded from
+# RaikaRanks at startup; Unicode remains the readable fallback if loading fails.
 RANK_TIER_CUSTOM_EMOJI: list = [
-    ('🥉', '6328082690826312420'),   # 0  Bronze
-    ('🥈', '6329970118499508946'),   # 1  Silver
-    ('🥇', '6329998460988694381'),   # 2  Gold
-    ('🎖', '6327697024237970628'),   # 3  Platinum
-    ('💎', '6327953596994296978'),   # 4  Diamond
-    ('💚', '6330001798178282933'),   # 5  Emerald
-    ('❤️', '6330143652358134805'),  # 6  Ruby
-    ('💙', '6327637186753600878'),   # 7  Sapphire
-    ('💜', '6327770377984417518'),   # 8  Amethyst
-    ('⚫', '6328090288623460813'),   # 9  Obsidian
-    ('🧿', '6327632247541210511'),   # 10 Mythic
-    ('⭐', '6328119498696040532'),   # 11 Legendary
-    ('✨', '6327788777624313884'),   # 12 Ethereal
-    ('🏆', '6327974723938427602'),   # 13 Top Tier
+    ('🥉', ''),   # 0  Bronze
+    ('🥈', ''),   # 1  Silver
+    ('🥇', ''),   # 2  Gold
+    ('🎖', ''),   # 3  Platinum
+    ('💎', ''),   # 4  Diamond
+    ('💚', ''),   # 5  Emerald
+    ('❤️', ''),  # 6  Ruby
+    ('💙', ''),   # 7  Sapphire
+    ('💜', ''),   # 8  Amethyst
+    ('⚫', ''),   # 9  Obsidian
+    ('🧿', ''),   # 10 Mythic
+    ('⭐', ''),   # 11 Legendary
+    ('✨', ''),   # 12 Ethereal
+    ('🏆', ''),   # 13 Top Tier
 ]
 
 # Tier ring colours for image generation (PIL RGB tuples)
@@ -17143,10 +17272,122 @@ RANK_TIER_COLORS: list = [
 ]
 
 def get_rank_custom_emoji_tag(rank_idx: int) -> str:
-    """Return an animated <tg-emoji> tag for HTML parse_mode messages."""
+    """Return a rank custom-emoji tag, or plain Unicode when no ID is loaded."""
     tier_idx = max(0, min(rank_idx // 5, len(RANK_TIER_CUSTOM_EMOJI) - 1))
     plain, ce_id = RANK_TIER_CUSTOM_EMOJI[tier_idx]
+    if not ce_id:
+        return plain
     return f'<tg-emoji emoji-id="{ce_id}">{plain}</tg-emoji>'
+
+
+async def clone_rank_emoji_pack_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only command to create a separate copy of RaikaRanks for this bot."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    if int(user.id) not in OWNER_IDS:
+        await message.reply_text("Only a bot owner can create the rank emoji pack.")
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
+        await message.reply_text("Run /clonerankemoji in a private chat with the bot.")
+        return
+
+    import httpx as _httpx
+
+    token = context.bot.token
+    async with _httpx.AsyncClient(timeout=30) as client:
+        async def telegram_call(method: str, payload: dict):
+            try:
+                response = await client.post(
+                    f"https://api.telegram.org/bot{token}/{method}",
+                    json=payload,
+                )
+                result = response.json()
+            except Exception:
+                raise RuntimeError(
+                    f"Telegram request {method} failed; check the bot connection."
+                ) from None
+            if not result.get("ok"):
+                raise RuntimeError(
+                    str(result.get("description") or f"Telegram {method} failed")
+                )
+            return result.get("result")
+
+        try:
+            bot_info = await telegram_call("getMe", {})
+            bot_username = bot_info.get("username")
+            if not bot_username:
+                raise RuntimeError("Telegram did not return the bot username.")
+            pack_name = f"rollers_rank_emoji_by_{bot_username}".lower()
+
+            try:
+                pack = await telegram_call("getStickerSet", {"name": pack_name})
+                created = False
+            except RuntimeError as exc:
+                if "stickerset_invalid" not in str(exc).casefold():
+                    raise
+                source = await telegram_call(
+                    "getStickerSet", {"name": RAIKA_RANK_PACK_NAME}
+                )
+                source_stickers = [
+                    sticker for sticker in source.get("stickers", [])
+                    if sticker.get("file_id")
+                ]
+                if not source_stickers:
+                    raise RuntimeError("RaikaRanks contains no stickers to copy.")
+                if len(source_stickers) > 200:
+                    raise RuntimeError(
+                        "RaikaRanks has more than Telegram's 200-sticker custom emoji limit."
+                    )
+
+                sticker_format = (
+                    "animated" if source.get("is_animated")
+                    else "video" if source.get("is_video")
+                    else "static"
+                )
+                input_stickers = [
+                    {
+                        "sticker": sticker["file_id"],
+                        "format": sticker_format,
+                        "emoji_list": [sticker.get("emoji") or "🏅"],
+                    }
+                    for sticker in source_stickers
+                ]
+                await telegram_call(
+                    "createNewStickerSet",
+                    {
+                        "user_id": user.id,
+                        "name": pack_name,
+                        "title": RANK_EMOJI_PACK_TITLE,
+                        "sticker_type": "custom_emoji",
+                        "stickers": input_stickers[:50],
+                    },
+                )
+                for sticker in input_stickers[50:]:
+                    await telegram_call(
+                        "addStickerToSet",
+                        {
+                            "user_id": user.id,
+                            "name": pack_name,
+                            "sticker": sticker,
+                        },
+                    )
+                pack = await telegram_call("getStickerSet", {"name": pack_name})
+                created = True
+
+            applied = _apply_rank_custom_emoji_stickers(pack.get("stickers", []))
+            action = "Created" if created else "Found existing"
+            await message.reply_text(
+                f"{action} “{RANK_EMOJI_PACK_TITLE}” with "
+                f"{len(pack.get('stickers', []))} emojis.\n"
+                f"Rank display loaded {applied} tier emojis.\n"
+                f"https://t.me/addemoji/{pack_name}"
+            )
+        except RuntimeError as exc:
+            await message.reply_text(f"Could not create the rank emoji pack: {exc}")
 
 def get_rank_tier_color(rank_idx: int) -> tuple:
     """Return (R,G,B) colour for a rank's tier — used in image generation."""
@@ -45314,6 +45555,7 @@ def main():
     application.add_handler(CommandHandler("managers", listmanagers_command))
     application.add_handler(CommandHandler("custody", custody_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("clonerankemoji", clone_rank_emoji_pack_command))
     application.add_handler(CommandHandler("ranks", ranks_command))
     application.add_handler(CommandHandler("weekly", weekly_command))
     application.add_handler(CommandHandler("profile", profile_command))

@@ -36,6 +36,8 @@ _Describe the high-level user-facing capabilities of this app once they exist._
 
 _Populate as you build — explicit user instructions worth remembering across sessions._
 - Keep casino messages professional: prefer the static, non-animated premium emoji icons shown in the user's latest reference image for normal casino UI text; use standard Unicode as a fallback instead of turning every symbol into an animated custom emoji. Use animated emojis only in locations the user explicitly marks. Wait for the user's marked examples before changing emoji placement; do not replace, rename, or modify the existing emoji packs.
+- Use the public `RaikaRanks` set only for rank labels; the owner-triggered copy should be titled “Rollers Rank Emoji”.
+- Use `ST_5PUsQEHbxN5l8Vy2fX6sGtMS_QszrcOUd9xfUjno_by_StickersPackRobot` only for the Diamonds game, not general casino text.
 
 ## Gotchas
 
