@@ -9294,23 +9294,121 @@ def add_loss_to_rakeback(user_id: str, loss_amount: float):
     # No save_data() here — caller (game handler) always calls save_data_critical() after.
     # Calling it here creates extra background threads that race against the game's own save.
 
-def add_match_history(user_id: str, game_type: str, bet_amount: float, result: str, winnings: float = 0.0, custom_id: str = None):
-    """Add match to user's history and update permanent lifetime counters."""
-    user_id = str(user_id)
-    if user_id not in user_match_history:
-        user_match_history[user_id] = []
+def _next_match_history_id(user_id: str, now_ms: int) -> str:
+    """Return a unique seven-digit ID within this player's retained history."""
+    existing_matches = user_match_history.get(str(user_id), [])
+    if not isinstance(existing_matches, list):
+        existing_matches = []
+    used_ids = {
+        str(match.get("id") or match.get("match_id") or "")
+        for match in existing_matches
+        if isinstance(match, dict)
+    }
+    numeric_ids = [
+        int(match_id) for match_id in used_ids
+        if match_id.isdigit() and len(match_id) == 7
+    ]
+    candidate = (
+        max(numeric_ids) + 1
+        if numeric_ids
+        else 1_000_000 + (now_ms % 9_000_000)
+    )
+    if candidate > 9_999_999:
+        candidate = 1_000_000
+    while str(candidate) in used_ids:
+        candidate += 1
+        if candidate > 9_999_999:
+            candidate = 1_000_000
+    return str(candidate)
 
+
+def add_match_history(
+    user_id: str,
+    game_type: str,
+    bet_amount: float,
+    result: str,
+    winnings: float = 0.0,
+    custom_id: str = None,
+    *,
+    verified: bool = False,
+    target_multiplier: float | None = None,
+    result_multiplier: float | None = None,
+):
+    """Record one settled match and update permanent lifetime counters."""
+    import math
     import time
-    now_ts = int(time.time())
+
+    user_id = str(user_id)
+    if not isinstance(user_match_history.get(user_id), list):
+        user_match_history[user_id] = []
+    try:
+        bet_amount = float(bet_amount)
+        winnings = float(winnings)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("[MATCH_HISTORY] Ignored a match with non-numeric amounts")
+        return None
+    result = str(result or "").strip()
+    game_type = str(game_type or "").strip()
+    if (
+        not game_type
+        or not result
+        or not math.isfinite(bet_amount)
+        or not math.isfinite(winnings)
+        or bet_amount <= 0
+        or winnings < 0
+    ):
+        logger.warning("[MATCH_HISTORY] Ignored an invalid settled match record")
+        return None
+
+    verification_fields = {}
+    if verified:
+        try:
+            target_multiplier = float(target_multiplier)
+            result_multiplier = float(result_multiplier)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("[MATCH_HISTORY] Ignored a match missing verification data")
+            return None
+        did_win = result_multiplier >= target_multiplier
+        expected_payout = bet_amount * target_multiplier if did_win else 0.0
+        if (
+            not math.isfinite(target_multiplier)
+            or not math.isfinite(result_multiplier)
+            or not math.isfinite(expected_payout)
+            or target_multiplier <= 1.0
+            or target_multiplier > 100
+            or result_multiplier < 1.01
+            or result_multiplier > 1000
+            or did_win != result.lower().startswith("win")
+            or abs(winnings - expected_payout) > 0.01
+        ):
+            logger.warning("[MATCH_HISTORY] Rejected a match with inconsistent verification data")
+            return None
+        verification_fields = {
+            "verified": True,
+            "target_multiplier": round(target_multiplier, 8),
+            "result_multiplier": round(result_multiplier, 8),
+        }
+
+    now_ts = time.time()
+    now_ms = int(now_ts * 1000)
+    used_ids = {
+        str(match.get("id") or match.get("match_id") or "")
+        for match in user_match_history[user_id]
+        if isinstance(match, dict)
+    }
+    match_id = str(custom_id).strip() if custom_id is not None else ""
+    if not match_id or match_id in used_ids:
+        match_id = _next_match_history_id(user_id, now_ms)
     match_data = {
         'timestamp': now_ts,
-        'id': custom_id or str(int(time.time() * 1000))[-5:],
+        'id': match_id,
         'game': game_type,
-        'bet': bet_amount,
-        'result': result,  # 'win' or 'loss'
-        'winnings': winnings,
-        'profit': winnings - bet_amount if result == 'win' else -bet_amount
+        'bet': round(bet_amount, 8),
+        'result': result,
+        'winnings': round(winnings, 8),
+        'profit': round(winnings - bet_amount, 8),
     }
+    match_data.update(verification_fields)
     user_match_history[user_id].append(match_data)
 
     # Keep a rolling detail history while lifetime totals remain permanent.
@@ -17731,20 +17829,120 @@ async def maxbet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 MATCHES_PER_PAGE = 4
 
+
+def _is_verified_limbo_match(match: dict) -> bool:
+    """Check that a Limbo record's stored wager and payout match its draw."""
+    import math
+
+    if not isinstance(match, dict) or match.get("verified") is not True:
+        return False
+    try:
+        bet = float(match.get("bet"))
+        payout = float(match.get("winnings"))
+        target = float(match.get("target_multiplier"))
+        result_multiplier = float(match.get("result_multiplier"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not all(math.isfinite(value) for value in (bet, payout, target, result_multiplier)):
+        return False
+    if (
+        bet <= 0
+        or payout < 0
+        or target <= 1.0
+        or target > 100
+        or result_multiplier < 1.01
+        or result_multiplier > 1000
+    ):
+        return False
+    did_win = result_multiplier >= target
+    expected_payout = bet * target if did_win else 0.0
+    return (
+        math.isfinite(expected_payout)
+        and did_win == str(match.get("result", "")).startswith("win")
+        and abs(payout - expected_payout) <= 0.01
+    )
+
+
+def _has_unverified_limbo_history(user_id: str) -> bool:
+    matches = user_match_history.get(str(user_id), [])
+    if not isinstance(matches, list):
+        return False
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        game_key = "".join(ch for ch in str(match.get("game", "")).lower() if ch.isalnum())
+        if game_key == "limbo" and not _is_verified_limbo_match(match):
+            return True
+    return False
+
+
+def _matches_empty_message(user_id: str) -> str:
+    if _has_unverified_limbo_history(user_id):
+        return (
+            "<b>No verified matches to show.</b>\n"
+            "Older Limbo entries are hidden because their bet/outcome details cannot be checked. "
+            "The saved records were not deleted."
+        )
+    return "<b>No matches found!</b>\nStart playing to see your history."
+
+
 def _build_matches_page(user_id: str, page: int) -> tuple[str, InlineKeyboardMarkup] | None:
     """Build a recent-first, four-record match-history page."""
+    import math as _history_math
+
     user_id = str(user_id)
     matches = user_match_history.get(user_id, [])
-    if not matches:
+    if not isinstance(matches, list) or not matches:
         return None
 
-    # Newest games appear first, as in the requested reference screen.
+    # Ignore corrupt legacy rows so one bad amount/timestamp cannot break
+    # pagination or display fabricated-looking NaN/negative values.
+    valid_entries = []
+    hidden_unverified_limbo = False
+    for index, raw_match in enumerate(matches):
+        if not isinstance(raw_match, dict):
+            continue
+        game_name_raw = str(raw_match.get("game", "") or "").strip()
+        game_key_raw = "".join(ch for ch in game_name_raw.lower() if ch.isalnum())
+        if game_key_raw == "limbo" and not _is_verified_limbo_match(raw_match):
+            hidden_unverified_limbo = True
+            continue
+        try:
+            bet = float(raw_match.get("bet", 0) or 0)
+            payout = float(raw_match.get("winnings", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            not game_name_raw
+            or not _history_math.isfinite(bet)
+            or not _history_math.isfinite(payout)
+            or bet <= 0
+            or payout < 0
+        ):
+            continue
+        try:
+            timestamp = float(raw_match.get("timestamp", 0) or 0)
+            if not _history_math.isfinite(timestamp) or timestamp < 0:
+                timestamp = 0.0
+            elif timestamp > 100_000_000_000:
+                timestamp /= 1000.0
+        except (TypeError, ValueError, OverflowError):
+            timestamp = 0.0
+        normalized_match = dict(raw_match)
+        normalized_match.update({
+            "game": game_name_raw,
+            "bet": bet,
+            "winnings": payout,
+            "timestamp": timestamp,
+        })
+        valid_entries.append((timestamp, index, normalized_match))
+
+    if not valid_entries:
+        return None
+    # Newest games appear first; original list order breaks same-time ties.
     sorted_matches = [
-        match for _, match in sorted(
-            enumerate(matches),
-            key=lambda item: (float(item[1].get("timestamp", 0) or 0), item[0]),
-            reverse=True,
-        )
+        item[2]
+        for item in sorted(valid_entries, key=lambda item: (item[0], item[1]), reverse=True)
     ]
 
     total_pages = max(1, (len(sorted_matches) + MATCHES_PER_PAGE - 1) // MATCHES_PER_PAGE)
@@ -17754,7 +17952,7 @@ def _build_matches_page(user_id: str, page: int) -> tuple[str, InlineKeyboardMar
 
     game_display = {
         "mines": ("💎", "Mines"),
-        "limbo": ("🎯", "Limbo"),
+        "limbo": ("⬆️", "Limbo"),
         "dice": ("🎲", "Dice Battle"),
         "dicebattle": ("🎲", "Dice Battle"),
         "coinflip": ("🪙", "Coinflip"),
@@ -17787,32 +17985,38 @@ def _build_matches_page(user_id: str, page: int) -> tuple[str, InlineKeyboardMar
         _history_tz = _history_dt.timezone.utc
 
     for match in page_matches:
-        raw_game = str(match.get("game", "game") or "game")
+        raw_game = str(match["game"])
         game_key = "".join(ch for ch in raw_game.lower() if ch.isalnum())
         game_emoji, game_name = game_display.get(
             game_key,
             ("🎮", raw_game.replace("_", " ").title()),
         )
-        match_id = _html.escape(str(match.get("id") or match.get("match_id") or "—"))
-        bet = float(match.get("bet", 0) or 0)
-        payout = float(match.get("winnings", 0) or 0)
+        match_id_value = match.get("id") or match.get("match_id") or "—"
+        match_id = _html.escape(str(match_id_value))
+        bet = match["bet"]
+        payout = match["winnings"]
         try:
             played_at = _history_dt.datetime.fromtimestamp(
                 float(match.get("timestamp", 0) or 0), _history_tz
             ).strftime("%d/%m/%y %I:%M %p")
+            played_at = played_at.replace(" 0", " ", 1)
         except (TypeError, ValueError, OSError, OverflowError):
             played_at = "Date unavailable"
 
         lines.append(
             f"{game_emoji} <b>{_html.escape(game_name)} #{match_id}</b>\n"
-            f"🎟 Bet: <b>{_html.escape(_format_real_balance(bet, currency))}</b>\n"
-            f"💵 Payout: <b>{_html.escape(_format_real_balance(payout, currency))}</b>\n"
+            f"🟥 Bet: <b>{_html.escape(_format_real_balance(bet, currency))}</b>\n"
+            f"🟩 Payout: <b>{_html.escape(_format_real_balance(payout, currency))}</b>\n"
             f"🕒 {played_at}"
         )
 
-    text = "📋 <b>Game History</b>\n\n"
-    text += "\n\n──────────────\n\n".join(lines)
+    text = "\n\n──────────────\n\n".join(lines)
     text += f"\n\nPage {page}/{total_pages}"
+    if hidden_unverified_limbo and page == 1:
+        text += (
+            "\n\n<i>Older Limbo entries without verifiable bet/outcome details are hidden; "
+            "saved records remain unchanged.</i>"
+        )
 
     nav_row = []
     if page > 1:
@@ -17835,7 +18039,7 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     matches = user_match_history.get(user_id, [])
     if not matches:
         await update.message.reply_text(
-            "<b>No matches found!</b>\nStart playing to see your history.",
+            _matches_empty_message(user_id),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -17843,7 +18047,7 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     page = _build_matches_page(user_id, 1)
     if page is None:
         await update.message.reply_text(
-            "<b>No matches found!</b>\nStart playing to see your history.",
+            _matches_empty_message(user_id),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -17880,7 +18084,13 @@ async def matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         result = _build_matches_page(user_id, page)
         if result is None:
             try:
-                await query.answer("No matches yet.", show_alert=True)
+                await query.answer(
+                    "Older Limbo entries are hidden because their bets cannot be verified. "
+                    "Saved records were not deleted."
+                    if _has_unverified_limbo_history(user_id)
+                    else "No matches yet.",
+                    show_alert=True,
+                )
             except Exception:
                 pass
             return
@@ -19543,6 +19753,43 @@ async def show_casino_games(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.edit_message_text(games_message, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
 # Command handlers for games
+def _parse_limbo_command_args(args, balance: float, user_currency: str) -> tuple[float, float]:
+    """Parse /limbo bet-first syntax without guessing based on numeric size.
+
+    The documented order is bet then multiplier. A multiplier-first form is
+    accepted only when the first value explicitly includes an x suffix.
+    """
+    import math
+
+    if len(args) < 2:
+        raise ValueError("bet and multiplier are required")
+    first = str(args[0]).strip().lower()
+    second = str(args[1]).strip().lower()
+    first_is_multiplier = first.endswith("x")
+    second_is_multiplier = second.endswith("x")
+    if first_is_multiplier and second_is_multiplier:
+        raise ValueError("only one argument can be the multiplier")
+
+    if first_is_multiplier:
+        amount_text = second
+        target_text = first[:-1]
+    else:
+        amount_text = first
+        target_text = second[:-1] if second_is_multiplier else second
+
+    if amount_text in {"all", "full"}:
+        bet_amount_input = convert_usd_to_currency(balance, user_currency)
+    elif amount_text == "half":
+        bet_amount_input = convert_usd_to_currency(balance, user_currency) / 2
+    else:
+        bet_amount_input = float(amount_text)
+    bet_amount = float(convert_currency_to_usd(bet_amount_input, user_currency))
+    target_multiplier = float(target_text)
+    if not math.isfinite(bet_amount) or not math.isfinite(target_multiplier):
+        raise ValueError("bet and multiplier must be finite numbers")
+    return bet_amount, target_multiplier
+
+
 async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /limbo command - Easy format: /limbo amount multiplier"""
     if not update.message or not update.message.from_user:
@@ -19568,30 +19815,11 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # ── Parse arguments ───────────────────────────────────────────────────────
+    # ── Parse arguments in the documented bet-first order ─────────────────────
     try:
-        arg0 = context.args[0].lower().replace('x', '')
-        arg1 = context.args[1].lower().replace('x', '')
-        try:
-            v0 = float(arg0)
-            v1 = float(arg1)
-        except Exception:
-            v0, v1 = 0, 0
-
-        if v0 > 1.5 and v1 <= v0 and v1 > 0 and v0 <= 1000 and v1 < 10000:
-            target_multiplier = v0
-            bet_amount_input  = v1
-        else:
-            raw = context.args[0].lower()
-            if raw in ["all", "full"]:
-                bet_amount_input = convert_usd_to_currency(balance, user_currency)
-            elif raw == "half":
-                bet_amount_input = convert_usd_to_currency(balance, user_currency) / 2
-            else:
-                bet_amount_input = float(context.args[0])
-            target_multiplier = float(arg1)
-
-        bet_amount = convert_currency_to_usd(bet_amount_input, user_currency)
+        bet_amount, target_multiplier = _parse_limbo_command_args(
+            context.args, balance, user_currency
+        )
     except Exception as e:
         logger.error(f"limbo_command parse error uid={user_id}: {e}")
         await update.message.reply_text("❌ Usage: /limbo <bet> <multiplier>  e.g. /limbo 1 3x")
@@ -19631,13 +19859,23 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         winnings = bet_amount * target_multiplier
         ultra_secure_add_user_balance(user_id, winnings, "win")
         deduct_house_balance(max(0, winnings - bet_amount))
-        add_match_history(user_id, 'limbo', bet_amount, 'win', winnings)
+        add_match_history(
+            user_id, 'limbo', bet_amount, 'win', winnings,
+            verified=True,
+            target_multiplier=target_multiplier,
+            result_multiplier=result_multiplier,
+        )
         await announce_win_to_channel(context, username, winnings, "Limbo", multiplier=target_multiplier, bet=bet_amount, user_id=user_id)
         won = True
     else:
         add_house_balance(bet_amount)
         add_loss_to_rakeback(user_id, bet_amount)
-        add_match_history(user_id, 'limbo', bet_amount, 'loss', 0)
+        add_match_history(
+            user_id, 'limbo', bet_amount, 'loss', 0,
+            verified=True,
+            target_multiplier=target_multiplier,
+            result_multiplier=result_multiplier,
+        )
         winnings = 0
         won      = False
 
@@ -29932,8 +30170,13 @@ async def handle_bot_mention(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Bot mention/reply handler — AI chat disabled."""
     pass
 
+_LIMBO_SETTLING_USERS: set[str] = set()
+
+
 async def handle_limbo_multiplier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle limbo multiplier input (interactive flow)."""
+    import math
+
     if not update.message or not update.message.text:
         return
 
@@ -29942,22 +30185,37 @@ async def handle_limbo_multiplier(update: Update, context: ContextTypes.DEFAULT_
     username = tg_user.username or tg_user.first_name or "Player"
     user_currency = get_user_currency(user_id)
     game_data = active_games.get(user_id)
-    if not game_data or game_data['type'] != 'limbo':
+    if not isinstance(game_data, dict) or game_data.get('type') != 'limbo':
         return
 
     try:
         target_multiplier = float(update.message.text.strip())
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         await update.message.reply_text("❌ Please enter a valid multiplier (e.g., 2.5)")
         return
 
-    if target_multiplier < 1.1 or target_multiplier > 100:
+    if not math.isfinite(target_multiplier) or target_multiplier < 1.1 or target_multiplier > 100:
         await update.message.reply_text("❌ Multiplier must be between 1.1x - 100x")
         return
 
-    bet_amount = game_data['bet_amount']
+    try:
+        bet_amount = float(game_data['bet_amount'])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        await update.message.reply_text("❌ This Limbo round could not be verified.")
+        return
+    if not math.isfinite(bet_amount) or bet_amount <= 0:
+        await update.message.reply_text("❌ This Limbo round could not be verified.")
+        return
+
+    # Telegram may redeliver updates or the player may submit twice quickly.
+    # Set this synchronously before any awaited operation so one round settles once.
+    if user_id in _LIMBO_SETTLING_USERS:
+        await update.message.reply_text("⏳ This Limbo round is already being settled.")
+        return
+    _LIMBO_SETTLING_USERS.add(user_id)
 
     if not ultra_secure_deduct_user_balance(user_id, bet_amount, "bet"):
+        _LIMBO_SETTLING_USERS.discard(user_id)
         await update.message.reply_text("❌ Insufficient balance!")
         return
 
@@ -29974,13 +30232,22 @@ async def handle_limbo_multiplier(update: Update, context: ContextTypes.DEFAULT_
         winnings = bet_amount * target_multiplier
         ultra_secure_add_user_balance(user_id, winnings, "win")
         deduct_house_balance(max(0, winnings - bet_amount))
-        add_match_history(user_id, 'limbo', bet_amount, 'win', winnings)
-        await announce_win_to_channel(context, username, winnings, "Limbo", multiplier=target_multiplier, bet=bet_amount, user_id=user_id)
+        add_match_history(
+            user_id, 'limbo', bet_amount, 'win', winnings,
+            verified=True,
+            target_multiplier=target_multiplier,
+            result_multiplier=result_multiplier,
+        )
         won = True
     else:
         add_house_balance(bet_amount)
         add_loss_to_rakeback(user_id, bet_amount)
-        add_match_history(user_id, 'limbo', bet_amount, 'loss', 0)
+        add_match_history(
+            user_id, 'limbo', bet_amount, 'loss', 0,
+            verified=True,
+            target_multiplier=target_multiplier,
+            result_multiplier=result_multiplier,
+        )
         winnings = 0
         won      = False
 
@@ -29989,6 +30256,21 @@ async def handle_limbo_multiplier(update: Update, context: ContextTypes.DEFAULT_
     # Clean up session
     user_states.pop(user_id, None)
     active_games.pop(user_id, None)
+    _LIMBO_SETTLING_USERS.discard(user_id)
+
+    if won:
+        try:
+            await announce_win_to_channel(
+                context,
+                username,
+                winnings,
+                "Limbo",
+                multiplier=target_multiplier,
+                bet=bet_amount,
+                user_id=user_id,
+            )
+        except Exception:
+            logger.warning("[LIMBO] Win announcement failed after settlement for user=%s", user_id)
 
     new_balance = get_user_balance(user_id)
     bet_d   = format_balance_in_currency(bet_amount, user_currency)
@@ -30016,9 +30298,9 @@ async def handle_limbo_multiplier(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(caption, parse_mode=ParseMode.HTML)
 
 # ── Telegram Stars deposit ────────────────────────────────────────────────────
-# These are the Star amounts shown in the supplied Telegram checkout examples.
-# The final fiat price for buying Stars is always displayed by Telegram for the
-# user's region; the invoice itself is denominated in XTR.
+# The smaller bundles follow the existing checkout pricing. Larger bundles
+# extend the same rate, with 50,000 Stars capped at the existing top-tier rate
+# (4,167 Stars for $50). Telegram shows the user's final regional price.
 TELEGRAM_STARS_PACKAGES = (
     (84, 1.00),
     (167, 2.00),
@@ -30026,6 +30308,9 @@ TELEGRAM_STARS_PACKAGES = (
     (834, 10.00),
     (1667, 20.00),
     (4167, 50.00),
+    (10000, 119.99),
+    (25000, 299.98),
+    (50000, 599.95),
 )
 
 TELEGRAM_STAR_BUTTON_EMOJI_ID = "6305280073796689362"
@@ -31021,8 +31306,8 @@ async def handle_telegram_stars_menu(query, context: ContextTypes.DEFAULT_TYPE) 
 
     rows = []
     for stars, usd in TELEGRAM_STARS_PACKAGES:
-        label = f"${usd:.2f}"
-        button_factory = success_btn if usd in (1.00, 50.00) else primary_btn
+        label = f"{stars:,} Stars · ${usd:,.2f}"
+        button_factory = success_btn if stars in (84, 50000) else primary_btn
         rows.append([
             button_factory(
                 label,
@@ -31034,7 +31319,8 @@ async def handle_telegram_stars_menu(query, context: ContextTypes.DEFAULT_TYPE) 
     await _edit_callback_text_or_send(
         query,
         context,
-        "<b>Select or enter deposit amount</b>\n\n"
+        "<b>Select a Telegram Stars deposit</b>\n\n"
+        "<i>Bundles include options up to 50,000 Stars.</i>\n\n"
         "<b>Minimum deposit is $1</b>\n\n"
         f"{_telegram_warning_emoji()} Funds from this deposit will be locked for withdrawals, "
         "transfers, and rains until you wager ×5 in PvE modes.\n\n"
